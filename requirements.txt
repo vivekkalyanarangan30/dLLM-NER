@@ -1,0 +1,10 @@
+transformers==4.46.2
+torch==2.5.1
+peft
+accelerate
+datasets
+matplotlib
+numpy
+pyyaml
+tqdm
+vllm

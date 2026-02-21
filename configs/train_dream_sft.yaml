@@ -1,0 +1,53 @@
+model:
+  name: "Dream-org/Dream-v0-Base-7B"
+  torch_dtype: "bfloat16"
+
+lora:
+  r: 64
+  lora_alpha: 128
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  lora_dropout: 0.05
+  bias: "none"
+  task_type: "CAUSAL_LM"
+
+data:
+  dataset: "Universal-NER/Pile-NER-type"
+  train_split_ratio: 0.9
+  max_seq_length: 512
+  max_completion_length: 128
+  negative_types_min: 2
+  negative_types_max: 5
+
+training:
+  epochs: 5
+  batch_size_per_gpu: 8
+  num_gpus: 2
+  gradient_accumulation_steps: 2
+  learning_rate: 5.0e-5
+  warmup_steps: 200
+  scheduler: "cosine"
+  weight_decay: 0.01
+  precision: "bf16"
+  max_grad_norm: 1.0
+
+diffusion:
+  noise_schedule: "log_linear"
+  pad_loss_weight: 0.05
+  random_truncation: true
+
+checkpointing:
+  save_every: 500
+  eval_every: 500
+  best_model_metric: "val_loss"
+  save_adapter_only: true
+  output_dir: "checkpoints/"
+
+inference:
+  pad_penalty_max: 5.0

@@ -1,0 +1,42 @@
+model:
+  base_model: "Dream-org/Dream-v0-Base-7B"
+  adapter_path: "checkpoints/best_adapter"
+  merge_adapter: true
+  torch_dtype: "bfloat16"
+
+inference:
+  num_steps: 8
+  max_output_len: 128
+  use_remasking: false
+  pad_penalty_max: 5.0
+
+baseline:
+  model: "Universal-NER/UniNER-7B-type"
+  use_vllm: true
+
+benchmarks:
+  crossner:
+    domains:
+      - "ai"
+      - "literature"
+      - "music"
+      - "politics"
+      - "science"
+  mit_movie: true
+  mit_restaurant: true
+
+evaluation:
+  metric: "micro_f1"
+  strict_match: true
+
+pareto:
+  steps: [1, 2, 4, 8, 16, 32]
+
+uncertainty:
+  num_runs: 10
+
+ablations:
+  num_steps: [1, 2, 4, 8, 16]
+  remasking: [true, false]
+  negative_sampling: [0, 2, 5]
+  lora_rank: [32, 64, 128]
