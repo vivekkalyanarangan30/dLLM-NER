@@ -281,6 +281,30 @@ class TestExtractPassageAndType:
         passage, etype = _extract_passage_and_type(human_msg)
         assert etype == "organization"
 
+    def test_what_describes_format(self):
+        """Parse the 'What describes X in the text?' format (most common in Pile-NER)."""
+        from data.prepare_pile_ner import _extract_passage_and_type
+
+        human_msg = (
+            "Text: Ronaldo plays for Al Nassr since January 2023.\n\n"
+            "What describes person in the text?"
+        )
+        passage, etype = _extract_passage_and_type(human_msg)
+        assert passage == "Ronaldo plays for Al Nassr since January 2023."
+        assert etype == "person"
+
+    def test_what_describes_multi_word_type(self):
+        """Parse multi-word entity type from 'What describes' format."""
+        from data.prepare_pile_ner import _extract_passage_and_type
+
+        human_msg = (
+            "Text: The enzyme catalase breaks down hydrogen peroxide.\n\n"
+            "What describes chemical compound in the text?"
+        )
+        passage, etype = _extract_passage_and_type(human_msg)
+        assert passage == "The enzyme catalase breaks down hydrogen peroxide."
+        assert etype == "chemical compound"
+
 
 class TestParseEntityList:
     """Tests for prepare_pile_ner._parse_entity_list."""
@@ -446,6 +470,52 @@ class TestGroupByPassage:
         ]
         groups = group_by_passage(mock_dataset)
         assert len(groups) == 0
+
+    def test_multiple_pairs_per_row(self):
+        """A single row with multiple human/gpt pairs extracts all types."""
+        from data.prepare_pile_ner import group_by_passage
+
+        passage_text = "Ronaldo plays for Al Nassr."
+        mock_dataset = [
+            {
+                "conversations": [
+                    {
+                        "from": "human",
+                        "value": f"Text: {passage_text}\n\nWhat describes person in the text?",
+                    },
+                    {"from": "gpt", "value": '["Ronaldo"]'},
+                    {
+                        "from": "human",
+                        "value": f"Text: {passage_text}\n\nWhat describes organization in the text?",
+                    },
+                    {"from": "gpt", "value": '["Al Nassr"]'},
+                ]
+            },
+        ]
+        groups = group_by_passage(mock_dataset)
+        assert passage_text in groups
+        assert len(groups[passage_text]) == 2
+        types = {g["type"] for g in groups[passage_text]}
+        assert types == {"person", "organization"}
+
+    def test_what_describes_format(self):
+        """The 'What describes X in the text?' format is parsed correctly."""
+        from data.prepare_pile_ner import group_by_passage
+
+        mock_dataset = [
+            {
+                "conversations": [
+                    {
+                        "from": "human",
+                        "value": "Text: Paris is beautiful.\n\nWhat describes location in the text?",
+                    },
+                    {"from": "gpt", "value": '["Paris"]'},
+                ]
+            },
+        ]
+        groups = group_by_passage(mock_dataset)
+        assert "Paris is beautiful." in groups
+        assert groups["Paris is beautiful."][0]["type"] == "location"
 
 
 class TestFormatForDiffusion:

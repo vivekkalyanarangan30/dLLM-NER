@@ -47,29 +47,42 @@ TRAIN_SPLIT_RATIO = 0.9
 def _extract_passage_and_type(human_message: str) -> Tuple[Optional[str], Optional[str]]:
     """Parse the passage text and entity type from a human-turn message.
 
-    The human message in Pile-NER-type has the form::
+    The human message in Pile-NER-type has several format variants::
 
+        # Variant 1 (most common):
+        Text: <passage>
+
+        What describes <type> in the text?
+
+        # Variant 2:
         Text: <passage>
         Use the provided text ... entities that belong to the following category: <type>
 
-    or similar wording.  We extract the passage (everything between ``Text: ``
-    and the instruction line) and the queried entity type.
+        # Variant 3:
+        Text: <passage>
+        Please identify entities of category: <type>
+
+    We extract the passage and the queried entity type.
 
     Returns
     -------
     Tuple[Optional[str], Optional[str]]
         ``(passage, entity_type)`` or ``(None, None)`` on parse failure.
     """
-    # Extract passage: everything after "Text: " up to the next instruction line
-    passage_match = re.search(r"Text:\s*(.+?)(?:\nUse the provided text|\nPlease)", human_message, re.DOTALL)
+    # Extract passage: everything after "Text: " up to the instruction line
+    # Try all known instruction markers
+    passage_match = re.search(
+        r"Text:\s*(.+?)(?:\n+What describes\b|\nUse the provided text|\nPlease)",
+        human_message,
+        re.DOTALL,
+    )
     if not passage_match:
-        # Fallback: try splitting on "Text: " and taking until "Use the"
+        # Fallback: split on "Text: " and find the instruction boundary
         parts = human_message.split("Text: ", 1)
         if len(parts) < 2:
             return None, None
         rest = parts[1]
-        # Find where the instruction starts
-        for marker in ["Use the provided text", "Please "]:
+        for marker in ["What describes ", "Use the provided text", "Please "]:
             idx = rest.find(marker)
             if idx != -1:
                 passage = rest[:idx].strip()
@@ -79,15 +92,19 @@ def _extract_passage_and_type(human_message: str) -> Tuple[Optional[str], Option
     else:
         passage = passage_match.group(1).strip()
 
-    # Extract entity type: look for "category: <type>" pattern
-    type_match = re.search(r"category:\s*(.+?)(?:\n|$)", human_message)
+    # Extract entity type — try multiple patterns
+    # Pattern 1: "What describes <type> in the text?"
+    type_match = re.search(r"What describes\s+(.+?)\s+in the text", human_message)
     if not type_match:
-        # Fallback: try "type: <type>"
+        # Pattern 2: "category: <type>"
+        type_match = re.search(r"category:\s*(.+?)(?:\n|$)", human_message)
+    if not type_match:
+        # Pattern 3: "type: <type>"
         type_match = re.search(r"type:\s*(.+?)(?:\n|$)", human_message)
     if not type_match:
         return passage, None
 
-    entity_type = type_match.group(1).strip().rstrip(".")
+    entity_type = type_match.group(1).strip().rstrip(".?")
     return passage, entity_type
 
 
@@ -197,28 +214,35 @@ def group_by_passage(dataset: Dataset) -> Dict[str, List[Dict[str, Any]]]:
             skipped += 1
             continue
 
-        human_msg = None
-        gpt_msg = None
-        for turn in conversations:
-            if turn.get("from") == "human":
-                human_msg = turn.get("value", "")
-            elif turn.get("from") == "gpt":
-                gpt_msg = turn.get("value", "")
+        # Each row can have MULTIPLE human/gpt pairs (one per entity type).
+        # Process them in consecutive pairs.
+        pairs_found = 0
+        i = 0
+        while i < len(conversations) - 1:
+            if conversations[i].get("from") == "human" and \
+               conversations[i + 1].get("from") == "gpt":
+                human_msg = conversations[i].get("value", "")
+                gpt_msg = conversations[i + 1].get("value", "")
+                i += 2
 
-        if not human_msg or not gpt_msg:
+                if not human_msg or not gpt_msg:
+                    continue
+
+                passage, entity_type = _extract_passage_and_type(human_msg)
+                if not passage or not entity_type:
+                    continue
+
+                mentions = _parse_entity_list(gpt_msg)
+                passage_groups[passage].append({
+                    "type": entity_type,
+                    "mentions": mentions,
+                })
+                pairs_found += 1
+            else:
+                i += 1
+
+        if pairs_found == 0:
             skipped += 1
-            continue
-
-        passage, entity_type = _extract_passage_and_type(human_msg)
-        if not passage or not entity_type:
-            skipped += 1
-            continue
-
-        mentions = _parse_entity_list(gpt_msg)
-        passage_groups[passage].append({
-            "type": entity_type,
-            "mentions": mentions,
-        })
 
     if skipped:
         logger.warning("Skipped %d rows during grouping (parse failures).", skipped)
