@@ -185,14 +185,49 @@ def _find_entity_start(passage: str, entity_text: str, used_offsets: set) -> int
 # Grouping: multi-turn -> single passage
 # ---------------------------------------------------------------------------
 
+def _extract_entity_type(question: str) -> Optional[str]:
+    """Extract entity type from a question-only turn.
+
+    Handles formats like::
+
+        "What describes person in the text?"
+        "What describes chemical compound in the text?"
+
+    Returns
+    -------
+    Optional[str]
+        The entity type, or None if not matched.
+    """
+    m = re.search(r"What describes\s+(.+?)\s+in the text", question)
+    if m:
+        return m.group(1).strip().rstrip(".?")
+    # Fallback: "category:" or "type:" patterns
+    m = re.search(r"category:\s*(.+?)(?:\n|$)", question)
+    if not m:
+        m = re.search(r"type:\s*(.+?)(?:\n|$)", question)
+    if m:
+        return m.group(1).strip().rstrip(".")
+    return None
+
+
 def group_by_passage(dataset: Dataset) -> Dict[str, List[Dict[str, Any]]]:
     """Group the multi-turn Pile-NER-type data by passage.
 
-    Each row in the source dataset has a ``"conversations"`` field (list of
-    dicts with ``"from"`` and ``"value"`` keys).  The human turn contains the
-    passage and a single entity type; the GPT turn has the entity mentions.
+    The Pile-NER-type conversation format is::
 
-    We group all (entity_type, mentions) pairs that share the same passage.
+        Turn 0 (human): "Text: <passage>"
+        Turn 1 (gpt):   "I've read this text."
+        Turn 2 (human): "What describes <type> in the text?"
+        Turn 3 (gpt):   '["entity1", "entity2"]'
+        Turn 4 (human): "What describes <type2> in the text?"
+        Turn 5 (gpt):   '["entity3"]'
+        ...
+
+    The passage appears only in the first human turn; subsequent human turns
+    contain only the entity-type question.
+
+    Also supports the legacy test format where each human turn contains
+    both ``Text: <passage>`` and a ``category:``/``type:`` instruction.
 
     Parameters
     ----------
@@ -210,34 +245,91 @@ def group_by_passage(dataset: Dataset) -> Dict[str, List[Dict[str, Any]]]:
 
     for row in dataset:
         conversations = row.get("conversations", [])
-        if len(conversations) < 2:
+        if len(conversations) < 4:
+            # Need at least: human(text), gpt(ack), human(query), gpt(entities)
+            # But also support 2-turn legacy format
+            if len(conversations) >= 2:
+                # Try legacy format: single human/gpt pair with both passage and type
+                human_msg = None
+                gpt_msg = None
+                for turn in conversations:
+                    if turn.get("from") == "human":
+                        human_msg = turn.get("value", "")
+                    elif turn.get("from") == "gpt":
+                        gpt_msg = turn.get("value", "")
+                if human_msg and gpt_msg:
+                    passage, entity_type = _extract_passage_and_type(human_msg)
+                    if passage and entity_type:
+                        mentions = _parse_entity_list(gpt_msg)
+                        passage_groups[passage].append({
+                            "type": entity_type,
+                            "mentions": mentions,
+                        })
+                        continue
             skipped += 1
             continue
 
-        # Each row can have MULTIPLE human/gpt pairs (one per entity type).
-        # Process them in consecutive pairs.
+        # --- Standard Pile-NER format ---
+        # Step 1: Extract passage from the first human turn
+        first_human = None
+        for turn in conversations:
+            if turn.get("from") == "human":
+                first_human = turn.get("value", "")
+                break
+
+        if not first_human:
+            skipped += 1
+            continue
+
+        # The first human turn should start with "Text: "
+        passage = None
+        if "Text:" in first_human:
+            parts = first_human.split("Text:", 1)
+            if len(parts) == 2:
+                raw_passage = parts[1]
+                # Strip everything after a question marker if present
+                for marker in ["What describes ", "Use the provided text", "Please "]:
+                    idx = raw_passage.find(marker)
+                    if idx != -1:
+                        raw_passage = raw_passage[:idx]
+                        break
+                passage = raw_passage.strip()
+
+        if not passage:
+            skipped += 1
+            continue
+
+        # Step 2: Process human/gpt pairs after the first acknowledgment
         pairs_found = 0
         i = 0
         while i < len(conversations) - 1:
-            if conversations[i].get("from") == "human" and \
-               conversations[i + 1].get("from") == "gpt":
-                human_msg = conversations[i].get("value", "")
-                gpt_msg = conversations[i + 1].get("value", "")
+            turn = conversations[i]
+            next_turn = conversations[i + 1]
+
+            if turn.get("from") == "human" and next_turn.get("from") == "gpt":
+                human_val = turn.get("value", "")
+                gpt_val = next_turn.get("value", "")
+
+                # Skip the initial "Text: ..." / "I've read this text." pair
+                if "I've read this text" in gpt_val or "I have read this text" in gpt_val:
+                    i += 2
+                    continue
+
+                # Extract entity type from the question
+                entity_type = _extract_entity_type(human_val)
+                if not entity_type:
+                    # Try the combined format (passage + type in one message)
+                    _, entity_type = _extract_passage_and_type(human_val)
+
+                if entity_type:
+                    mentions = _parse_entity_list(gpt_val)
+                    passage_groups[passage].append({
+                        "type": entity_type,
+                        "mentions": mentions,
+                    })
+                    pairs_found += 1
+
                 i += 2
-
-                if not human_msg or not gpt_msg:
-                    continue
-
-                passage, entity_type = _extract_passage_and_type(human_msg)
-                if not passage or not entity_type:
-                    continue
-
-                mentions = _parse_entity_list(gpt_msg)
-                passage_groups[passage].append({
-                    "type": entity_type,
-                    "mentions": mentions,
-                })
-                pairs_found += 1
             else:
                 i += 1
 

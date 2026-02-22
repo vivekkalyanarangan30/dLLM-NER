@@ -479,14 +479,16 @@ class TestGroupByPassage:
         mock_dataset = [
             {
                 "conversations": [
+                    {"from": "human", "value": f"Text: {passage_text}"},
+                    {"from": "gpt", "value": "I've read this text."},
                     {
                         "from": "human",
-                        "value": f"Text: {passage_text}\n\nWhat describes person in the text?",
+                        "value": "What describes person in the text?",
                     },
                     {"from": "gpt", "value": '["Ronaldo"]'},
                     {
                         "from": "human",
-                        "value": f"Text: {passage_text}\n\nWhat describes organization in the text?",
+                        "value": "What describes organization in the text?",
                     },
                     {"from": "gpt", "value": '["Al Nassr"]'},
                 ]
@@ -499,15 +501,17 @@ class TestGroupByPassage:
         assert types == {"person", "organization"}
 
     def test_what_describes_format(self):
-        """The 'What describes X in the text?' format is parsed correctly."""
+        """The real Pile-NER-type format with acknowledgment turn."""
         from data.prepare_pile_ner import group_by_passage
 
         mock_dataset = [
             {
                 "conversations": [
+                    {"from": "human", "value": "Text: Paris is beautiful."},
+                    {"from": "gpt", "value": "I've read this text."},
                     {
                         "from": "human",
-                        "value": "Text: Paris is beautiful.\n\nWhat describes location in the text?",
+                        "value": "What describes location in the text?",
                     },
                     {"from": "gpt", "value": '["Paris"]'},
                 ]
