@@ -412,8 +412,18 @@ def validate(
     evaluation.
     """
     model.eval()
+
+    # Disable gradient checkpointing during validation — it can produce
+    # degenerate outputs when combined with torch.no_grad() in some custom
+    # model implementations (e.g. Dream-7B).
+    gc_was_enabled = getattr(model, "gradient_checkpointing", False)
+    unwrapped = accelerator.unwrap_model(model)
+    if hasattr(unwrapped, "gradient_checkpointing_disable"):
+        unwrapped.gradient_checkpointing_disable()
+
     total_loss = 0.0
     n_batches = 0
+    skipped_empty = 0
 
     for i, batch in enumerate(val_loader):
         if max_batches is not None and i >= max_batches:
@@ -425,8 +435,11 @@ def validate(
         prompt_len = prompt_ids.size(1)
         comp_len = completion_ids.size(1)
 
+        # Use the device from the actual val batch (not from training batch)
+        batch_device = completion_ids.device
+
         # Fixed timestep for deterministic validation
-        t = torch.full((batch_size,), 0.5, device=device)
+        t = torch.full((batch_size,), 0.5, device=batch_device)
 
         noisy_completion, mask = mask_completion_tokens(
             completion_ids, t, mask_token_id=MASK_TOKEN_ID
@@ -437,17 +450,46 @@ def validate(
         seq_len = noisy_input.size(1)
         outputs = model(input_ids=noisy_input, num_logits_to_keep=seq_len)
         logits = outputs.logits
+
+        # Diagnostic logging for the first batch
+        if i == 0:
+            logger.info(
+                f"  [Val] batch 0: logits.shape={list(logits.shape)}, "
+                f"seq_len={seq_len}, prompt_len={prompt_len}, comp_len={comp_len}, "
+                f"mask_sum={mask.sum().item()}/{mask.numel()}"
+            )
+
+        # Guard: ensure logits cover the completion region
+        if logits.size(1) <= prompt_len:
+            if i == 0:
+                logger.warning(
+                    f"  [Val] logits.size(1)={logits.size(1)} <= prompt_len={prompt_len}! "
+                    f"num_logits_to_keep may not be working. Skipping batch."
+                )
+            skipped_empty += 1
+            continue
+
         completion_logits = logits[:, prompt_len:, :]
 
         masked_logits = completion_logits[mask]
         masked_targets = completion_ids[mask]
 
         if masked_logits.numel() == 0:
+            skipped_empty += 1
             continue
 
         loss_per_token = F.cross_entropy(
             masked_logits, masked_targets, reduction="none"
         )
+
+        # Diagnostic: log first batch loss details
+        if i == 0:
+            n_pad = (masked_targets == pad_token_id).sum().item()
+            n_real = masked_targets.numel() - n_pad
+            logger.info(
+                f"  [Val] batch 0: CE mean={loss_per_token.mean().item():.4f}, "
+                f"n_masked={masked_logits.size(0)} (real={n_real}, pad={n_pad})"
+            )
 
         weighted_loss = apply_pad_loss_weight(
             loss_per_token, masked_targets, pad_token_id, pad_weight=pad_loss_weight
@@ -456,7 +498,16 @@ def validate(
         total_loss += weighted_loss.item()
         n_batches += 1
 
+    # Re-enable gradient checkpointing if it was on before
+    if gc_was_enabled and hasattr(unwrapped, "gradient_checkpointing_enable"):
+        unwrapped.gradient_checkpointing_enable()
+
     model.train()
+
+    logger.info(
+        f"  [Val] Processed {n_batches} batches, skipped {skipped_empty}, "
+        f"total_loss={total_loss:.6f}"
+    )
 
     if n_batches == 0:
         return float("inf")
