@@ -267,17 +267,21 @@ Compares:
 ### Extract entities from text
 
 ```python
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+from transformers import AutoModel, AutoTokenizer
 from peft import PeftModel
 from inference.predict import extract_entities
 
-# Load model
-base = AutoModelForCausalLM.from_pretrained(
-    "Dream-org/Dream-v0-Base-7B", torch_dtype=torch.bfloat16, device_map="auto"
+# Load model (Dream-7B uses AutoModel, not AutoModelForCausalLM)
+base = AutoModel.from_pretrained(
+    "Dream-org/Dream-v0-Base-7B", torch_dtype=torch.bfloat16,
+    device_map="auto", trust_remote_code=True,
 )
 model = PeftModel.from_pretrained(base, "checkpoints/best_adapter")
 model = model.merge_and_unload()
-tokenizer = AutoTokenizer.from_pretrained("Dream-org/Dream-v0-Base-7B")
+tokenizer = AutoTokenizer.from_pretrained(
+    "Dream-org/Dream-v0-Base-7B", trust_remote_code=True,
+)
 
 # Extract
 entities = extract_entities(

@@ -48,7 +48,7 @@ from datasets import Dataset, load_from_disk
 from peft import LoraConfig, get_peft_model, PeftModel
 from torch.utils.data import DataLoader
 from transformers import (
-    AutoModelForCausalLM,
+    AutoModel,
     AutoTokenizer,
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
@@ -103,7 +103,9 @@ def load_model_and_tokenizer(cfg: Dict[str, Any], accelerator: Accelerator):
     torch_dtype = getattr(torch, torch_dtype_str)
 
     accelerator.print(f"Loading base model: {model_name}")
-    model = AutoModelForCausalLM.from_pretrained(
+    # Dream-7B uses a custom DreamModel class (not registered as CausalLM),
+    # so we must use AutoModel with trust_remote_code=True.
+    model = AutoModel.from_pretrained(
         model_name,
         torch_dtype=torch_dtype,
         trust_remote_code=True,
@@ -343,7 +345,10 @@ def training_step(
     noisy_input = torch.cat([prompt_ids, noisy_completion], dim=1)  # (B, P+C)
 
     # --- Forward pass -------------------------------------------------------
-    outputs = model(input_ids=noisy_input)
+    # Dream's forward() defaults to num_logits_to_keep=0 (returns empty logits).
+    # We need logits for at least the completion positions.
+    seq_len = noisy_input.size(1)
+    outputs = model(input_ids=noisy_input, num_logits_to_keep=seq_len)
     logits = outputs.logits  # (B, P+C, V)
 
     # --- Extract completion logits ------------------------------------------
@@ -427,7 +432,8 @@ def validate(
 
         noisy_input = torch.cat([prompt_ids, noisy_completion], dim=1)
 
-        outputs = model(input_ids=noisy_input)
+        seq_len = noisy_input.size(1)
+        outputs = model(input_ids=noisy_input, num_logits_to_keep=seq_len)
         logits = outputs.logits
         completion_logits = logits[:, prompt_len:, :]
 

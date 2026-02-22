@@ -157,7 +157,10 @@ def extract_entities(
 
     for step in range(num_steps):
         # Forward pass
-        logits = model(input_ids=sequence).logits[0]  # (seq_len, vocab_size)
+        # Dream's forward() defaults to num_logits_to_keep=0 (empty logits).
+        # Pass the full sequence length to get logits for all positions.
+        seq_len = sequence.size(1)
+        logits = model(input_ids=sequence, num_logits_to_keep=seq_len).logits[0]  # (seq_len, vocab_size)
         output_logits = logits[prompt_len:]
 
         # Penalise PAD tokens
@@ -295,7 +298,10 @@ def extract_entities_with_trajectory(
 
     for step in range(num_steps):
         # Forward pass
-        logits = model(input_ids=sequence).logits[0]  # (seq_len, vocab_size)
+        # Dream's forward() defaults to num_logits_to_keep=0 (empty logits).
+        # Pass the full sequence length to get logits for all positions.
+        seq_len = sequence.size(1)
+        logits = model(input_ids=sequence, num_logits_to_keep=seq_len).logits[0]  # (seq_len, vocab_size)
         output_logits = logits[prompt_len:]
 
         # Penalise PAD tokens
