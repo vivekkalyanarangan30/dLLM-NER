@@ -12,10 +12,10 @@ echo "=== Phase 1: Environment & Data ==="
 
 # Step 1.3: Download and reformat Pile-NER
 echo "Downloading and reformatting Pile-NER-type..."
-python -m data.prepare_pile_ner --output_dir data/processed/
+python -m data.prepare_pile_ner --output-dir data/processed/
 
 # Step 1.4: Analyze completion lengths
 echo "Analyzing completion lengths..."
-python -m data.analyze_lengths --data_dir data/processed/
+python -m data.analyze_lengths --data-dir data/processed/
 
 echo "Phase 1 complete!"

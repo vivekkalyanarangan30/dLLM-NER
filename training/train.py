@@ -284,7 +284,7 @@ def load_datasets(cfg: Dict[str, Any], tokenizer):
     )
     print(
         "[data] If completions are empty, run Phase 1 first: "
-        "python -m data.prepare_pile_ner --output_dir data/processed/",
+        "python -m data.prepare_pile_ner --output-dir data/processed/",
         flush=True,
     )
     from datasets import load_dataset as hf_load_dataset
@@ -296,7 +296,7 @@ def load_datasets(cfg: Dict[str, Any], tokenizer):
         raise ValueError(
             f"Raw dataset '{data_cfg['dataset']}' does not have a 'prompt' column "
             f"(columns: {raw.column_names}). You must run Phase 1 first:\n"
-            f"  python -m data.prepare_pile_ner --output_dir data/processed/\n"
+            f"  python -m data.prepare_pile_ner --output-dir data/processed/\n"
             f"Then set 'data.processed_path: data/processed/' in your config."
         )
 
