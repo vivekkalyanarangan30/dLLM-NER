@@ -43,7 +43,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 from accelerate import Accelerator
-from tqdm.auto import tqdm
 from accelerate.utils import set_seed
 from datasets import Dataset, load_from_disk
 from peft import LoraConfig, get_peft_model, PeftModel
@@ -1055,15 +1054,6 @@ def main():
     t_start = time.time()
     _diag_batches_logged = 0  # counter for first-batch diagnostics
 
-    # Progress bar (shows in Colab/terminal)
-    pbar = tqdm(
-        total=total_training_steps,
-        initial=resume_step,
-        desc="Training",
-        disable=not accelerator.is_main_process,
-        unit="step",
-    )
-
     for epoch in range(num_epochs):
         # Skip completed epochs when resuming
         if epoch < resume_epoch:
@@ -1126,12 +1116,17 @@ def main():
                     current_lr = lr_scheduler.get_last_lr()[0]
                     elapsed = time.time() - t_start
 
-                    # Progress bar update
-                    pbar.set_postfix(
-                        loss=f"{avg_loss:.4f}",
-                        lr=f"{current_lr:.1e}",
-                        epoch=f"{epoch+1}/{num_epochs}",
-                    )
+                    # Print progress on a new line (Colab-friendly)
+                    if accelerator.is_main_process:
+                        elapsed_h = elapsed / 3600
+                        pct = global_step / total_training_steps * 100
+                        print(
+                            f"  Step {global_step}/{total_training_steps} ({pct:.0f}%) | "
+                            f"epoch {epoch+1}/{num_epochs} | "
+                            f"loss={avg_loss:.4f} | lr={current_lr:.1e} | "
+                            f"{elapsed_h:.1f}h elapsed",
+                            flush=True,
+                        )
 
                     if accelerator.is_main_process:
                         # CSV log
@@ -1151,8 +1146,6 @@ def main():
                             },
                             step=global_step,
                         )
-
-                pbar.update(1)
 
                 # ---- Validation ------------------------------------------------
                 if global_step % eval_every == 0:
@@ -1215,8 +1208,7 @@ def main():
         )
 
     # ---- Final save --------------------------------------------------------
-    pbar.close()
-    accelerator.print("Training complete!")
+    accelerator.print("\nTraining complete!")
     accelerator.print(f"  Best val loss: {best_val_loss:.4f}")
     save_checkpoint(
         model, optimizer, lr_scheduler,
