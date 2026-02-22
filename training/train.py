@@ -364,11 +364,12 @@ def training_step(
     )
 
     if _diag:
-        logger.info(
+        print(
             f"  [TrainDiag {_TRAIN_STEP_DIAG_COUNT}] "
             f"t={t.tolist()}, mask_sum={mask.sum().item()}/{mask.numel()}, "
             f"comp_lengths={completion_lengths.tolist()}, "
-            f"prompt_len={prompt_len}, comp_len={comp_len}"
+            f"prompt_len={prompt_len}, comp_len={comp_len}",
+            flush=True,
         )
 
     # Concatenate prompt + noisy completion to form full input
@@ -382,10 +383,11 @@ def training_step(
     logits = outputs.logits  # (B, P+C, V)
 
     if _diag:
-        logger.info(
+        print(
             f"  [TrainDiag {_TRAIN_STEP_DIAG_COUNT}] "
             f"logits.shape={list(logits.shape)}, "
-            f"logits_range=[{logits.min().item():.4f}, {logits.max().item():.4f}]"
+            f"logits_range=[{logits.min().item():.4f}, {logits.max().item():.4f}]",
+            flush=True,
         )
 
     # --- Extract completion logits ------------------------------------------
@@ -403,9 +405,10 @@ def training_step(
 
     if masked_logits.numel() == 0:
         if _diag:
-            logger.warning(
+            print(
                 f"  [TrainDiag {_TRAIN_STEP_DIAG_COUNT}] "
-                f"EMPTY masked_logits! completion_logits.shape={list(completion_logits.shape)}"
+                f"EMPTY masked_logits! completion_logits.shape={list(completion_logits.shape)}",
+                flush=True,
             )
             _TRAIN_STEP_DIAG_COUNT += 1
         # Edge case: no tokens were masked (extremely unlikely but possible)
@@ -432,13 +435,14 @@ def training_step(
 
     if _diag:
         n_pad = (masked_targets == pad_token_id).sum().item()
-        logger.info(
+        print(
             f"  [TrainDiag {_TRAIN_STEP_DIAG_COUNT}] "
             f"CE_mean={loss_per_token.mean().item():.6f}, "
             f"weighted_loss={weighted_loss.item():.6f}, "
             f"batch_weight={batch_weight.item():.4f}, "
             f"final_loss={loss.item():.6f}, "
-            f"n_masked={masked_logits.size(0)} (pad={n_pad}, real={masked_logits.size(0)-n_pad})"
+            f"n_masked={masked_logits.size(0)} (pad={n_pad}, real={masked_logits.size(0)-n_pad})",
+            flush=True,
         )
         _TRAIN_STEP_DIAG_COUNT += 1
 
@@ -918,6 +922,44 @@ def main():
             },
         )
 
+    # ---- Sanity check: verify model works before training loop --------------
+    if resume_dir and accelerator.is_main_process:
+        print("=" * 50, flush=True)
+        print("RESUME SANITY CHECK", flush=True)
+        # Check adapter weights are non-zero
+        unwrapped_check = accelerator.unwrap_model(model)
+        lora_norms = {}
+        for name, param in unwrapped_check.named_parameters():
+            if "lora_" in name and param.requires_grad:
+                lora_norms[name] = param.data.abs().mean().item()
+                if len(lora_norms) >= 4:
+                    break
+        print(f"  LoRA weight norms (first 4): {lora_norms}", flush=True)
+
+        # Test forward pass on the first val batch
+        model.eval()
+        with torch.no_grad():
+            test_batch = next(iter(val_loader))
+            test_prompt = test_batch["prompt_ids"]
+            test_comp = test_batch["completion_ids"]
+            test_t = torch.full((test_prompt.size(0),), 0.5, device=test_prompt.device)
+            test_noisy, test_mask = mask_completion_tokens(test_comp, test_t, MASK_TOKEN_ID)
+            test_input = torch.cat([test_prompt, test_noisy], dim=1)
+            test_out = unwrapped_check(input_ids=test_input, num_logits_to_keep=test_input.size(1))
+            test_logits = test_out.logits
+            test_comp_logits = test_logits[:, test_prompt.size(1):, :]
+            test_masked_logits = test_comp_logits[test_mask]
+            test_masked_targets = test_comp[test_mask]
+            if test_masked_logits.numel() > 0:
+                test_ce = F.cross_entropy(test_masked_logits, test_masked_targets)
+                print(f"  Sanity check CE loss: {test_ce.item():.4f}", flush=True)
+                print(f"  logits.shape: {list(test_logits.shape)}", flush=True)
+                print(f"  mask_sum: {test_mask.sum().item()}/{test_mask.numel()}", flush=True)
+            else:
+                print(f"  WARNING: sanity check got empty masked_logits!", flush=True)
+        model.train()
+        print("=" * 50, flush=True)
+
     # ---- Training loop -----------------------------------------------------
     accelerator.print(f"\nStarting training for {num_epochs} epochs")
     accelerator.print(f"  Steps per epoch:      {steps_per_epoch}")
@@ -977,11 +1019,12 @@ def main():
                 # Diagnostic: log details for the first 3 batches after resume
                 if _diag_batches_logged < 3 and accelerator.is_main_process:
                     _diag_batches_logged += 1
-                    logger.info(
+                    print(
                         f"  [Diag] batch {_diag_batches_logged}: loss={loss.item():.6f}, "
                         f"prompt.shape={list(batch['prompt_ids'].shape)}, "
                         f"comp.shape={list(batch['completion_ids'].shape)}, "
-                        f"comp_lengths={batch['completion_lengths'].tolist()}"
+                        f"comp_lengths={batch['completion_lengths'].tolist()}",
+                        flush=True,
                     )
 
                 accelerator.backward(loss)
