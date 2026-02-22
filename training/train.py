@@ -105,6 +105,12 @@ def load_model_and_tokenizer(cfg: Dict[str, Any], accelerator: Accelerator):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # ---- Gradient checkpointing (saves VRAM at cost of ~20% speed) --------
+    if cfg.get("training", {}).get("gradient_checkpointing", False):
+        model.gradient_checkpointing_enable()
+        model.enable_input_require_grads()
+        accelerator.print("Gradient checkpointing enabled")
+
     # ---- Apply LoRA -------------------------------------------------------
     lora_cfg = cfg["lora"]
     lora_config = LoraConfig(

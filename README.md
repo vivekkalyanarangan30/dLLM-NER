@@ -21,12 +21,30 @@ bash scripts/run_phase5_speed.sh   # Throughput benchmarks
 
 ## Hardware Requirements
 
-| Phase | GPU | VRAM | Time |
-|-------|-----|------|------|
-| Data prep | CPU only | - | ~10 min |
-| Training | 1-2x A100-80GB | 80GB | ~2.5 hours |
-| Inference/Eval | 1x GPU | >=20GB | ~1-2 hours |
-| Tests | CPU only | - | <1 sec |
+| Phase | A100-80GB (2x) | L4-24GB (1x, Colab) |
+|-------|----------------|---------------------|
+| Data prep | ~10 min (CPU) | ~10 min (CPU) |
+| Training | ~2.5 hours | ~8-10 hours |
+| Inference/Eval | ~1-2 hours | ~1-2 hours |
+| Tests | <1 sec (CPU) | <1 sec (CPU) |
+
+### Running on L4 / Colab (24GB VRAM)
+
+Use the L4-tuned config instead of the default:
+
+```bash
+# Training on L4 (single GPU, gradient checkpointing, batch=2)
+python -m training.train --config configs/train_dream_sft_l4.yaml
+```
+
+Key differences from the A100 config:
+- `batch_size_per_gpu`: 8 -> 2
+- `gradient_accumulation_steps`: 2 -> 16 (effective batch stays 32)
+- `gradient_checkpointing`: enabled (saves ~40% VRAM, ~20% slower)
+- `max_seq_length`: 512 -> 384 (saves VRAM)
+- Single GPU (no `accelerate launch` needed)
+
+Inference works out of the box on L4 -- no config changes needed (model in bf16 ~14GB, well within 24GB).
 
 ## Project Structure
 
