@@ -27,6 +27,7 @@ lora:
 
 data:
   dataset: "Universal-NER/Pile-NER-type"
+  processed_path: "data/processed/"
   train_split_ratio: 0.9
   max_seq_length: 384
   max_completion_length: 128

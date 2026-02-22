@@ -163,47 +163,23 @@ def load_model_and_tokenizer(
 # ---------------------------------------------------------------------------
 
 def load_datasets(cfg: Dict[str, Any], tokenizer):
-    """Load the preprocessed Pile-NER dataset and return train/val splits.
+    """Load the Pile-NER dataset and return train/val splits.
 
-    Expects a pre-tokenized Arrow dataset on disk with columns:
-      - ``prompt_ids``: List[int]
-      - ``completion_ids``: List[int]
-      - ``completion_length``: int  (unpadded length of the completion)
+    Tries three loading strategies in order:
 
-    If the dataset is not yet pre-tokenized, it falls back to loading the
-    raw HuggingFace dataset and tokenizing on-the-fly.
+    1. **Pre-tokenized** (``preprocessed_path``): Arrow dataset with
+       ``prompt_ids``, ``completion_ids``, ``completion_length`` columns.
+    2. **Phase-1 processed** (``processed_path``): Arrow dataset with
+       ``prompt`` and ``completion`` string columns (output of
+       ``data/prepare_pile_ner.py``).  Tokenized on-the-fly.
+    3. **Raw HuggingFace** fallback: Downloads ``Universal-NER/Pile-NER-type``
+       and tokenizes its ``prompt``/``completion`` columns.
     """
     data_cfg = cfg["data"]
     max_completion_length = data_cfg.get("max_completion_length", 128)
-
-    # Try loading pre-tokenized dataset from disk first
-    dataset_path = data_cfg.get("preprocessed_path", None)
-    if dataset_path and Path(dataset_path).exists():
-        logger.info(f"Loading pre-tokenized dataset from {dataset_path}")
-        full_dataset = load_from_disk(dataset_path)
-        if isinstance(full_dataset, dict):
-            train_dataset = full_dataset["train"]
-            val_dataset = full_dataset["validation"]
-        else:
-            split_ratio = data_cfg.get("train_split_ratio", 0.9)
-            split = full_dataset.train_test_split(
-                test_size=1.0 - split_ratio, seed=42
-            )
-            train_dataset = split["train"]
-            val_dataset = split["test"]
-        return train_dataset, val_dataset
-
-    # Fallback: load raw dataset from HuggingFace and tokenize
-    logger.info(
-        f"Loading raw dataset: {data_cfg['dataset']} (will tokenize on-the-fly)"
-    )
-    from datasets import load_dataset as hf_load_dataset
-
-    raw = hf_load_dataset(data_cfg["dataset"], split="train")
-
-    # Tokenize
     pad_token_id = tokenizer.pad_token_id
 
+    # -- shared tokenization helper --
     def tokenize_example(example):
         prompt_text = example.get("prompt", "")
         completion_text = example.get("completion", "")
@@ -226,6 +202,103 @@ def load_datasets(cfg: Dict[str, Any], tokenizer):
             "completion_ids": completion_ids,
             "completion_length": completion_length,
         }
+
+    # -- helper to split a DatasetDict or single Dataset into train/val --
+    def _split_dataset(ds):
+        if isinstance(ds, dict):
+            train_ds = ds.get("train", None)
+            val_ds = ds.get("validation", ds.get("test", None))
+            if train_ds is None or val_ds is None:
+                raise ValueError(
+                    f"Expected 'train' and 'validation' splits, got {list(ds.keys())}"
+                )
+            return train_ds, val_ds
+        split_ratio = data_cfg.get("train_split_ratio", 0.9)
+        split = ds.train_test_split(test_size=1.0 - split_ratio, seed=42)
+        return split["train"], split["test"]
+
+    # -----------------------------------------------------------------
+    # Strategy 1: Pre-tokenized Arrow dataset (prompt_ids already exist)
+    # -----------------------------------------------------------------
+    dataset_path = data_cfg.get("preprocessed_path", None)
+    if dataset_path and Path(dataset_path).exists():
+        print(f"[data] Loading pre-tokenized dataset from {dataset_path}", flush=True)
+        full_dataset = load_from_disk(dataset_path)
+        train_dataset, val_dataset = _split_dataset(full_dataset)
+        if "prompt_ids" in train_dataset.column_names:
+            return train_dataset, val_dataset
+        # If loaded but NOT pre-tokenized, fall through to tokenize below
+        print("[data] Dataset lacks prompt_ids — will tokenize on-the-fly", flush=True)
+        train_dataset = train_dataset.map(
+            tokenize_example, remove_columns=train_dataset.column_names
+        )
+        val_dataset = val_dataset.map(
+            tokenize_example, remove_columns=val_dataset.column_names
+        )
+        return train_dataset, val_dataset
+
+    # -----------------------------------------------------------------
+    # Strategy 2: Phase-1 processed dataset (prompt/completion strings)
+    # -----------------------------------------------------------------
+    processed_path = data_cfg.get("processed_path", None)
+    if processed_path and Path(processed_path).exists():
+        print(f"[data] Loading Phase-1 processed dataset from {processed_path}", flush=True)
+        full_dataset = load_from_disk(processed_path)
+        train_dataset, val_dataset = _split_dataset(full_dataset)
+
+        # Sanity-check that the expected columns exist
+        if "prompt" not in train_dataset.column_names:
+            raise ValueError(
+                f"Phase-1 dataset at {processed_path} missing 'prompt' column. "
+                f"Columns: {train_dataset.column_names}. Re-run Phase 1."
+            )
+
+        print(
+            f"[data] Tokenizing {len(train_dataset)} train + "
+            f"{len(val_dataset)} val examples…",
+            flush=True,
+        )
+        train_dataset = train_dataset.map(
+            tokenize_example, remove_columns=train_dataset.column_names
+        )
+        val_dataset = val_dataset.map(
+            tokenize_example, remove_columns=val_dataset.column_names
+        )
+
+        # Quick sanity check
+        sample = train_dataset[0]
+        print(
+            f"[data] Sample — prompt_ids len={len(sample['prompt_ids'])}, "
+            f"completion_length={sample['completion_length']}",
+            flush=True,
+        )
+        return train_dataset, val_dataset
+
+    # -----------------------------------------------------------------
+    # Strategy 3: Fallback — raw HuggingFace dataset
+    # -----------------------------------------------------------------
+    print(
+        f"[data] WARNING: No processed_path configured. "
+        f"Loading raw HF dataset: {data_cfg['dataset']}",
+        flush=True,
+    )
+    print(
+        "[data] If completions are empty, run Phase 1 first: "
+        "python -m data.prepare_pile_ner --output_dir data/processed/",
+        flush=True,
+    )
+    from datasets import load_dataset as hf_load_dataset
+
+    raw = hf_load_dataset(data_cfg["dataset"], split="train")
+
+    # Verify the raw dataset has the expected columns
+    if "prompt" not in raw.column_names:
+        raise ValueError(
+            f"Raw dataset '{data_cfg['dataset']}' does not have a 'prompt' column "
+            f"(columns: {raw.column_names}). You must run Phase 1 first:\n"
+            f"  python -m data.prepare_pile_ner --output_dir data/processed/\n"
+            f"Then set 'data.processed_path: data/processed/' in your config."
+        )
 
     tokenized = raw.map(tokenize_example, remove_columns=raw.column_names)
 
@@ -510,10 +583,11 @@ def validate(
 
         # Diagnostic logging for the first batch
         if i == 0:
-            logger.info(
+            print(
                 f"  [Val] batch 0: logits.shape={list(logits.shape)}, "
                 f"seq_len={seq_len}, prompt_len={prompt_len}, comp_len={comp_len}, "
-                f"mask_sum={mask.sum().item()}/{mask.numel()}"
+                f"mask_sum={mask.sum().item()}/{mask.numel()}",
+                flush=True,
             )
 
         # Guard: ensure logits cover the completion region
@@ -543,9 +617,10 @@ def validate(
         if i == 0:
             n_pad = (masked_targets == pad_token_id).sum().item()
             n_real = masked_targets.numel() - n_pad
-            logger.info(
+            print(
                 f"  [Val] batch 0: CE mean={loss_per_token.mean().item():.4f}, "
-                f"n_masked={masked_logits.size(0)} (real={n_real}, pad={n_pad})"
+                f"n_masked={masked_logits.size(0)} (real={n_real}, pad={n_pad})",
+                flush=True,
             )
 
         weighted_loss = apply_pad_loss_weight(
@@ -561,9 +636,10 @@ def validate(
 
     model.train()
 
-    logger.info(
+    print(
         f"  [Val] Processed {n_batches} batches, skipped {skipped_empty}, "
-        f"total_loss={total_loss:.6f}"
+        f"total_loss={total_loss:.6f}",
+        flush=True,
     )
 
     if n_batches == 0:
