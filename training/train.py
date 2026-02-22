@@ -43,6 +43,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import yaml
 from accelerate import Accelerator
+from tqdm.auto import tqdm
 from accelerate.utils import set_seed
 from datasets import Dataset, load_from_disk
 from peft import LoraConfig, get_peft_model, PeftModel
@@ -54,6 +55,7 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
+from training.logger import TrainingLogger, plot_training_log
 from training.train_utils import (
     MASK_TOKEN_ID,
     alpha,
@@ -798,6 +800,9 @@ def main():
     # ---- Tracking ----------------------------------------------------------
     global_step = resume_step
 
+    # CSV logger (appends to output_dir/training_log.csv, survives restarts)
+    csv_logger = TrainingLogger(output_dir) if accelerator.is_main_process else None
+
     # Initialize trackers
     if accelerator.is_main_process:
         accelerator.init_trackers(
@@ -830,6 +835,15 @@ def main():
 
     model.train()
     t_start = time.time()
+
+    # Progress bar (shows in Colab/terminal)
+    pbar = tqdm(
+        total=total_training_steps,
+        initial=resume_step,
+        desc="Training",
+        disable=not accelerator.is_main_process,
+        unit="step",
+    )
 
     for epoch in range(num_epochs):
         # Skip completed epochs when resuming
@@ -881,14 +895,23 @@ def main():
                     avg_loss = epoch_loss / epoch_steps
                     current_lr = lr_scheduler.get_last_lr()[0]
                     elapsed = time.time() - t_start
-                    accelerator.print(
-                        f"  [Epoch {epoch+1}/{num_epochs}] "
-                        f"Step {global_step}/{total_training_steps} | "
-                        f"Loss: {avg_loss:.4f} | "
-                        f"LR: {current_lr:.2e} | "
-                        f"Time: {elapsed:.0f}s"
+
+                    # Progress bar update
+                    pbar.set_postfix(
+                        loss=f"{avg_loss:.4f}",
+                        lr=f"{current_lr:.1e}",
+                        epoch=f"{epoch+1}/{num_epochs}",
                     )
+
                     if accelerator.is_main_process:
+                        # CSV log
+                        csv_logger.log_train(
+                            step=global_step, epoch=epoch,
+                            train_loss=avg_loss,
+                            learning_rate=current_lr,
+                            elapsed_sec=elapsed,
+                        )
+                        # TensorBoard log
                         accelerator.log(
                             {
                                 "train/loss": avg_loss,
@@ -898,6 +921,8 @@ def main():
                             },
                             step=global_step,
                         )
+
+                pbar.update(1)
 
                 # ---- Validation ------------------------------------------------
                 if global_step % eval_every == 0:
@@ -914,6 +939,11 @@ def main():
                     accelerator.print(f"  Val loss: {val_loss:.4f}")
 
                     if accelerator.is_main_process:
+                        elapsed = time.time() - t_start
+                        csv_logger.log_val(
+                            step=global_step, epoch=epoch,
+                            val_loss=val_loss, elapsed_sec=elapsed,
+                        )
                         accelerator.log(
                             {"val/loss": val_loss},
                             step=global_step,
@@ -955,6 +985,7 @@ def main():
         )
 
     # ---- Final save --------------------------------------------------------
+    pbar.close()
     accelerator.print("Training complete!")
     accelerator.print(f"  Best val loss: {best_val_loss:.4f}")
     save_checkpoint(
@@ -969,6 +1000,12 @@ def main():
     # End tracking
     if accelerator.is_main_process:
         accelerator.end_training()
+        # Save final loss curve plot alongside the CSV
+        log_path = os.path.join(output_dir, "training_log.csv")
+        if os.path.exists(log_path):
+            plot_path = os.path.join(output_dir, "training_curves.png")
+            plot_training_log(log_path, save_path=plot_path, show=False)
+            accelerator.print(f"  Loss curves saved to {plot_path}")
 
     total_time = time.time() - t_start
     accelerator.print(f"  Total training time: {total_time / 3600:.2f} hours")
