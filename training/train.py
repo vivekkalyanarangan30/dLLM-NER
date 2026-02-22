@@ -94,11 +94,16 @@ def load_config(path: str) -> Dict[str, Any]:
 # Model setup
 # ---------------------------------------------------------------------------
 
-def load_model_and_tokenizer(cfg: Dict[str, Any], accelerator: Accelerator):
+def load_model_and_tokenizer(
+    cfg: Dict[str, Any],
+    accelerator: Accelerator,
+    resume_dir: Optional[str] = None,
+):
     """Load Dream-7B base model, apply LoRA, and return (model, tokenizer).
 
-    The base model weights are frozen; only LoRA adapter parameters are
-    trainable.
+    If *resume_dir* is provided, loads the LoRA adapter directly from the
+    checkpoint using ``PeftModel.from_pretrained`` (reliable weight restore).
+    Otherwise creates a fresh LoRA adapter with random initialisation.
     """
     model_name = cfg["model"]["name"]
     torch_dtype_str = cfg["model"].get("torch_dtype", "bfloat16")
@@ -129,16 +134,25 @@ def load_model_and_tokenizer(cfg: Dict[str, Any], accelerator: Accelerator):
         accelerator.print("Gradient checkpointing enabled")
 
     # ---- Apply LoRA -------------------------------------------------------
-    lora_cfg = cfg["lora"]
-    lora_config = LoraConfig(
-        r=lora_cfg["r"],
-        lora_alpha=lora_cfg["lora_alpha"],
-        target_modules=lora_cfg["target_modules"],
-        lora_dropout=lora_cfg.get("lora_dropout", 0.0),
-        bias=lora_cfg.get("bias", "none"),
-        task_type=lora_cfg.get("task_type", "CAUSAL_LM"),
-    )
-    model = get_peft_model(model, lora_config)
+    if resume_dir:
+        # Resume: load adapter config + weights from checkpoint in one step.
+        # PeftModel.from_pretrained is the reliable way to restore adapters
+        # (load_adapter can fail to replace the existing "default" adapter).
+        accelerator.print(f"  Loading LoRA adapter from checkpoint: {resume_dir}")
+        model = PeftModel.from_pretrained(model, resume_dir, is_trainable=True)
+    else:
+        # Fresh start: create new LoRA adapter with random init
+        lora_cfg = cfg["lora"]
+        lora_config = LoraConfig(
+            r=lora_cfg["r"],
+            lora_alpha=lora_cfg["lora_alpha"],
+            target_modules=lora_cfg["target_modules"],
+            lora_dropout=lora_cfg.get("lora_dropout", 0.0),
+            bias=lora_cfg.get("bias", "none"),
+            task_type=lora_cfg.get("task_type", "CAUSAL_LM"),
+        )
+        model = get_peft_model(model, lora_config)
+
     model.print_trainable_parameters()
 
     return model, tokenizer
@@ -744,14 +758,10 @@ def main():
     accelerator.print(f"  Output dir: {output_dir}")
 
     # ---- Model & tokenizer -------------------------------------------------
-    model, tokenizer = load_model_and_tokenizer(cfg, accelerator)
+    # Pass resume_dir so adapter weights are loaded via PeftModel.from_pretrained
+    # (more reliable than get_peft_model + load_adapter which can fail silently).
+    model, tokenizer = load_model_and_tokenizer(cfg, accelerator, resume_dir=resume_dir)
     pad_token_id = tokenizer.pad_token_id
-
-    # ---- Load adapter weights if resuming ----------------------------------
-    if resume_dir:
-        accelerator.print(f"  Resuming adapter weights from {resume_dir}")
-        unwrapped = accelerator.unwrap_model(model) if hasattr(accelerator, 'unwrap_model') else model
-        unwrapped.load_adapter(resume_dir, adapter_name="default")
 
     # ---- Dataset -----------------------------------------------------------
     train_dataset, val_dataset = load_datasets(cfg, tokenizer)
@@ -886,6 +896,7 @@ def main():
 
     model.train()
     t_start = time.time()
+    _diag_batches_logged = 0  # counter for first-batch diagnostics
 
     # Progress bar (shows in Colab/terminal)
     pbar = tqdm(
@@ -923,6 +934,16 @@ def main():
                     use_random_truncation=use_random_truncation,
                     device=device,
                 )
+
+                # Diagnostic: log details for the first 3 batches after resume
+                if _diag_batches_logged < 3 and accelerator.is_main_process:
+                    _diag_batches_logged += 1
+                    logger.info(
+                        f"  [Diag] batch {_diag_batches_logged}: loss={loss.item():.6f}, "
+                        f"prompt.shape={list(batch['prompt_ids'].shape)}, "
+                        f"comp.shape={list(batch['completion_ids'].shape)}, "
+                        f"comp_lengths={batch['completion_lengths'].tolist()}"
+                    )
 
                 accelerator.backward(loss)
 
