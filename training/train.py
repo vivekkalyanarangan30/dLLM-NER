@@ -295,6 +295,9 @@ def collate_fn(batch: List[Dict], pad_token_id: int, max_seq_length: int):
 # Training step
 # ---------------------------------------------------------------------------
 
+_TRAIN_STEP_DIAG_COUNT = 0  # module-level counter for first-call diagnostics
+
+
 def training_step(
     batch: Dict[str, torch.Tensor],
     model: nn.Module,
@@ -332,6 +335,8 @@ def training_step(
     torch.Tensor
         Scalar loss (weighted, ready for ``.backward()``).
     """
+    global _TRAIN_STEP_DIAG_COUNT
+
     prompt_ids = batch["prompt_ids"]           # (B, P)
     completion_ids = batch["completion_ids"]    # (B, C)
     completion_lengths = batch["completion_lengths"]  # (B,)
@@ -340,6 +345,7 @@ def training_step(
     batch_size = prompt_ids.size(0)
     prompt_len = prompt_ids.size(1)   # padded prompt length (all same after collate)
     comp_len = completion_ids.size(1)
+    _diag = _TRAIN_STEP_DIAG_COUNT < 5  # log first 5 calls
 
     # --- Random truncation (Dream-Coder) -----------------------------------
     if use_random_truncation:
@@ -357,6 +363,14 @@ def training_step(
         completion_ids, t, mask_token_id=MASK_TOKEN_ID
     )
 
+    if _diag:
+        logger.info(
+            f"  [TrainDiag {_TRAIN_STEP_DIAG_COUNT}] "
+            f"t={t.tolist()}, mask_sum={mask.sum().item()}/{mask.numel()}, "
+            f"comp_lengths={completion_lengths.tolist()}, "
+            f"prompt_len={prompt_len}, comp_len={comp_len}"
+        )
+
     # Concatenate prompt + noisy completion to form full input
     noisy_input = torch.cat([prompt_ids, noisy_completion], dim=1)  # (B, P+C)
 
@@ -366,6 +380,13 @@ def training_step(
     seq_len = noisy_input.size(1)
     outputs = model(input_ids=noisy_input, num_logits_to_keep=seq_len)
     logits = outputs.logits  # (B, P+C, V)
+
+    if _diag:
+        logger.info(
+            f"  [TrainDiag {_TRAIN_STEP_DIAG_COUNT}] "
+            f"logits.shape={list(logits.shape)}, "
+            f"logits_range=[{logits.min().item():.4f}, {logits.max().item():.4f}]"
+        )
 
     # --- Extract completion logits ------------------------------------------
     completion_logits = logits[:, prompt_len:, :]  # (B, C, V)
@@ -381,6 +402,12 @@ def training_step(
     masked_targets = completion_ids[mask]             # (N,)
 
     if masked_logits.numel() == 0:
+        if _diag:
+            logger.warning(
+                f"  [TrainDiag {_TRAIN_STEP_DIAG_COUNT}] "
+                f"EMPTY masked_logits! completion_logits.shape={list(completion_logits.shape)}"
+            )
+            _TRAIN_STEP_DIAG_COUNT += 1
         # Edge case: no tokens were masked (extremely unlikely but possible)
         return torch.tensor(0.0, device=device, requires_grad=True)
 
@@ -402,6 +429,18 @@ def training_step(
     batch_weight = importance.mean()
 
     loss = batch_weight * weighted_loss
+
+    if _diag:
+        n_pad = (masked_targets == pad_token_id).sum().item()
+        logger.info(
+            f"  [TrainDiag {_TRAIN_STEP_DIAG_COUNT}] "
+            f"CE_mean={loss_per_token.mean().item():.6f}, "
+            f"weighted_loss={weighted_loss.item():.6f}, "
+            f"batch_weight={batch_weight.item():.4f}, "
+            f"final_loss={loss.item():.6f}, "
+            f"n_masked={masked_logits.size(0)} (pad={n_pad}, real={masked_logits.size(0)-n_pad})"
+        )
+        _TRAIN_STEP_DIAG_COUNT += 1
 
     return loss
 
