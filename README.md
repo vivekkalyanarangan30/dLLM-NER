@@ -30,11 +30,22 @@ bash scripts/run_phase5_speed.sh   # Throughput benchmarks
 
 ### Running on L4 / Colab (24GB VRAM)
 
-Use the L4-tuned config instead of the default:
+Use the L4-tuned config. Checkpoints save to Google Drive so you can resume across Colab sessions:
 
 ```bash
-# Training on L4 (single GPU, gradient checkpointing, batch=2)
-python -m training.train --config configs/train_dream_sft_l4.yaml
+# Mount Google Drive (in Colab, this is automatic at /content/drive)
+CKPT_DIR="/content/drive/MyDrive/dLLM-NER/checkpoints"
+
+# Training on L4 — saves to Drive, auto-resumes if checkpoints exist
+bash scripts/run_phase2_train.sh --l4 --output_dir $CKPT_DIR
+
+# Or call directly:
+python -m training.train \
+    --config configs/train_dream_sft_l4.yaml \
+    --output_dir $CKPT_DIR
+
+# Force fresh start (ignore existing checkpoints):
+bash scripts/run_phase2_train.sh --l4 --output_dir $CKPT_DIR --no_resume
 ```
 
 Key differences from the A100 config:
@@ -43,15 +54,36 @@ Key differences from the A100 config:
 - `gradient_checkpointing`: enabled (saves ~40% VRAM, ~20% slower)
 - `max_seq_length`: 512 -> 384 (saves VRAM)
 - Single GPU (no `accelerate launch` needed)
+- `keep_last: 2` — only the 2 most recent step checkpoints are kept on Drive (plus `checkpoint-best` and `checkpoint-final` which are never deleted)
 
-Inference works out of the box on L4 -- no config changes needed (model in bf16 ~14GB, well within 24GB).
+Inference works out of the box on L4 — no config changes needed (model in bf16 ~14GB, well within 24GB).
+
+### Checkpoint Resume
+
+Training **automatically resumes** from the latest checkpoint if one exists in `--output_dir`. On resume it restores:
+- LoRA adapter weights
+- Optimizer state (AdamW momentum)
+- LR scheduler state
+- Global step, epoch, and best val_loss
+
+This means you can safely stop and restart Colab sessions — training picks up where it left off. Each checkpoint is ~300MB (adapter only) + optimizer/scheduler state.
+
+Checkpoint directory structure:
+```
+checkpoints/
+├── checkpoint-step-500/     # rotated (keep_last=2)
+├── checkpoint-step-1000/    # rotated (keep_last=2)
+├── checkpoint-best/         # never deleted, tracks lowest val_loss
+└── checkpoint-final/        # saved at end of training
+```
 
 ## Project Structure
 
 ```
 dLLM-NER/
 ├── configs/
-│   ├── train_dream_sft.yaml       # Training hyperparameters
+│   ├── train_dream_sft.yaml       # Training config (A100)
+│   ├── train_dream_sft_l4.yaml    # Training config (L4/Colab, 24GB)
 │   └── eval.yaml                  # Evaluation & experiment config
 ├── data/
 │   ├── prepare_pile_ner.py        # Download + reformat Pile-NER-type

@@ -47,7 +47,8 @@ checkpointing:
   eval_every: 500
   best_model_metric: "val_loss"
   save_adapter_only: true
-  output_dir: "checkpoints/"
+  keep_last: 2  # keep only last 2 step checkpoints (best/final always kept)
+  output_dir: "checkpoints/"  # overridden by --output_dir CLI flag
 
 inference:
   pad_penalty_max: 5.0

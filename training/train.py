@@ -7,20 +7,33 @@ Usage
 -----
 Single GPU::
 
-    python training/train.py --config configs/train_dream_sft.yaml
+    python -m training.train --config configs/train_dream_sft.yaml
 
 Multi-GPU via ``accelerate``::
 
-    accelerate launch --num_processes 2 training/train.py \
+    accelerate launch --num_processes 2 -m training.train \
         --config configs/train_dream_sft.yaml
+
+Resume from checkpoint::
+
+    python -m training.train --config configs/train_dream_sft_l4.yaml \
+        --output_dir /content/drive/MyDrive/dLLM-NER/checkpoints
+
+Google Colab with Drive::
+
+    python -m training.train --config configs/train_dream_sft_l4.yaml \
+        --output_dir /content/drive/MyDrive/dLLM-NER/checkpoints
 """
 
 from __future__ import annotations
 
 import argparse
+import glob
+import json
 import logging
 import math
 import os
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -453,16 +466,33 @@ def validate(
 # Checkpoint helpers
 # ---------------------------------------------------------------------------
 
+TRAINING_STATE_FILE = "training_state.json"
+
+
 def save_checkpoint(
     model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    lr_scheduler,
     accelerator: Accelerator,
     output_dir: str,
     step: int,
+    epoch: int,
+    best_val_loss: float,
     adapter_only: bool = True,
     tag: str = "",
+    keep_last: int = 2,
 ):
-    """Save a checkpoint.  When *adapter_only* is True, save only the LoRA
-    adapter weights (~300 MB).
+    """Save a checkpoint with training state for resumption.
+
+    When *adapter_only* is True, save only the LoRA adapter weights (~300 MB).
+    Also saves optimizer, scheduler, and training state (step, epoch, best_val_loss)
+    so training can be resumed.
+
+    Parameters
+    ----------
+    keep_last : int
+        Number of recent step-based checkpoints to keep. Set to 0 to keep all.
+        Tagged checkpoints (best, final) are never deleted.
     """
     if not accelerator.is_main_process:
         return
@@ -474,13 +504,109 @@ def save_checkpoint(
 
     os.makedirs(save_dir, exist_ok=True)
 
+    # Save adapter / model weights
     unwrapped = accelerator.unwrap_model(model)
     if adapter_only and hasattr(unwrapped, "save_pretrained"):
         unwrapped.save_pretrained(save_dir)
-        logger.info(f"Saved adapter checkpoint to {save_dir}")
     else:
         unwrapped.save_pretrained(save_dir)
-        logger.info(f"Saved full model checkpoint to {save_dir}")
+
+    # Save optimizer and scheduler state
+    torch.save(optimizer.state_dict(), os.path.join(save_dir, "optimizer.pt"))
+    torch.save(lr_scheduler.state_dict(), os.path.join(save_dir, "scheduler.pt"))
+
+    # Save training state as JSON (human-readable, easy to inspect)
+    training_state = {
+        "global_step": step,
+        "epoch": epoch,
+        "best_val_loss": best_val_loss,
+    }
+    with open(os.path.join(save_dir, TRAINING_STATE_FILE), "w") as f:
+        json.dump(training_state, f, indent=2)
+
+    logger.info(f"Saved checkpoint to {save_dir} (step={step}, epoch={epoch})")
+
+    # Rotate: keep only the last N step-based checkpoints
+    if keep_last > 0 and not tag:
+        _rotate_checkpoints(output_dir, keep_last)
+
+
+def _rotate_checkpoints(output_dir: str, keep_last: int):
+    """Delete old step-based checkpoints, keeping only the most recent ones.
+
+    Tagged checkpoints (best, final) are never deleted.
+    """
+    # Find all step-based checkpoint dirs
+    pattern = os.path.join(output_dir, "checkpoint-step-*")
+    step_dirs = sorted(glob.glob(pattern))
+
+    # Parse step numbers and sort
+    step_dirs_with_num = []
+    for d in step_dirs:
+        basename = os.path.basename(d)
+        try:
+            step_num = int(basename.replace("checkpoint-step-", ""))
+            step_dirs_with_num.append((step_num, d))
+        except ValueError:
+            continue
+
+    step_dirs_with_num.sort(key=lambda x: x[0])
+
+    # Delete oldest, keeping last N
+    to_delete = step_dirs_with_num[:-keep_last] if len(step_dirs_with_num) > keep_last else []
+    for step_num, d in to_delete:
+        logger.info(f"Rotating out old checkpoint: {d}")
+        shutil.rmtree(d)
+
+
+def find_latest_checkpoint(output_dir: str) -> Optional[str]:
+    """Find the most recent checkpoint in output_dir for resumption.
+
+    Prefers the latest step-based checkpoint. Falls back to 'checkpoint-best'
+    if no step-based checkpoints exist.
+
+    Returns
+    -------
+    str or None
+        Path to the checkpoint directory, or None if no checkpoint found.
+    """
+    if not os.path.isdir(output_dir):
+        return None
+
+    # Find step-based checkpoints
+    pattern = os.path.join(output_dir, "checkpoint-step-*")
+    step_dirs = glob.glob(pattern)
+
+    best_step = -1
+    best_dir = None
+    for d in step_dirs:
+        basename = os.path.basename(d)
+        try:
+            step_num = int(basename.replace("checkpoint-step-", ""))
+            if step_num > best_step:
+                best_step = step_num
+                best_dir = d
+        except ValueError:
+            continue
+
+    if best_dir and os.path.exists(os.path.join(best_dir, TRAINING_STATE_FILE)):
+        return best_dir
+
+    # Fall back to checkpoint-best
+    best_ckpt = os.path.join(output_dir, "checkpoint-best")
+    if os.path.isdir(best_ckpt) and os.path.exists(
+        os.path.join(best_ckpt, TRAINING_STATE_FILE)
+    ):
+        return best_ckpt
+
+    return None
+
+
+def load_training_state(checkpoint_dir: str) -> Dict[str, Any]:
+    """Load the training state JSON from a checkpoint directory."""
+    state_path = os.path.join(checkpoint_dir, TRAINING_STATE_FILE)
+    with open(state_path, "r") as f:
+        return json.load(f)
 
 
 # ---------------------------------------------------------------------------
@@ -498,10 +624,22 @@ def main():
         help="Path to the YAML configuration file.",
     )
     parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Override checkpoint output directory (e.g. /content/drive/MyDrive/checkpoints). "
+             "If not set, uses the value from the config file.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
         help="Random seed for reproducibility.",
+    )
+    parser.add_argument(
+        "--no_resume",
+        action="store_true",
+        help="Force start from scratch even if checkpoints exist.",
     )
     args = parser.parse_args()
 
@@ -511,6 +649,19 @@ def main():
     diff_cfg = cfg["diffusion"]
     ckpt_cfg = cfg["checkpointing"]
     data_cfg = cfg["data"]
+
+    # CLI --output_dir overrides config
+    output_dir = args.output_dir or ckpt_cfg.get("output_dir", "checkpoints/")
+    keep_last = ckpt_cfg.get("keep_last", 2)
+
+    # ---- Check for existing checkpoint to resume --------------------------
+    resume_dir = None
+    if not args.no_resume:
+        resume_dir = find_latest_checkpoint(output_dir)
+        if resume_dir:
+            logger.info(f"Found checkpoint to resume from: {resume_dir}")
+        else:
+            logger.info("No existing checkpoint found. Starting from scratch.")
 
     # ---- Accelerator -------------------------------------------------------
     precision_map = {
@@ -524,17 +675,24 @@ def main():
         mixed_precision=mixed_precision,
         gradient_accumulation_steps=train_cfg.get("gradient_accumulation_steps", 1),
         log_with="tensorboard",
-        project_dir=ckpt_cfg.get("output_dir", "checkpoints/"),
+        project_dir=output_dir,
     )
     set_seed(args.seed)
 
     accelerator.print("=" * 60)
     accelerator.print("  DiffusionNER-Zero Training")
     accelerator.print("=" * 60)
+    accelerator.print(f"  Output dir: {output_dir}")
 
     # ---- Model & tokenizer -------------------------------------------------
     model, tokenizer = load_model_and_tokenizer(cfg, accelerator)
     pad_token_id = tokenizer.pad_token_id
+
+    # ---- Load adapter weights if resuming ----------------------------------
+    if resume_dir:
+        accelerator.print(f"  Resuming adapter weights from {resume_dir}")
+        unwrapped = accelerator.unwrap_model(model) if hasattr(accelerator, 'unwrap_model') else model
+        unwrapped.load_adapter(resume_dir, adapter_name="default")
 
     # ---- Dataset -----------------------------------------------------------
     train_dataset, val_dataset = load_datasets(cfg, tokenizer)
@@ -592,6 +750,32 @@ def main():
             num_training_steps=total_training_steps,
         )
 
+    # ---- Resume optimizer/scheduler state ----------------------------------
+    resume_step = 0
+    resume_epoch = 0
+    best_val_loss = float("inf")
+
+    if resume_dir:
+        training_state = load_training_state(resume_dir)
+        resume_step = training_state["global_step"]
+        resume_epoch = training_state["epoch"]
+        best_val_loss = training_state["best_val_loss"]
+
+        opt_path = os.path.join(resume_dir, "optimizer.pt")
+        sched_path = os.path.join(resume_dir, "scheduler.pt")
+
+        if os.path.exists(opt_path):
+            optimizer.load_state_dict(torch.load(opt_path, map_location="cpu"))
+            accelerator.print(f"  Restored optimizer state")
+        if os.path.exists(sched_path):
+            lr_scheduler.load_state_dict(torch.load(sched_path, map_location="cpu"))
+            accelerator.print(f"  Restored scheduler state")
+
+        accelerator.print(
+            f"  Resuming from step={resume_step}, epoch={resume_epoch}, "
+            f"best_val_loss={best_val_loss:.4f}"
+        )
+
     # ---- Prepare with accelerator ------------------------------------------
     model, optimizer, train_loader, val_loader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_loader, val_loader, lr_scheduler
@@ -603,12 +787,10 @@ def main():
     max_grad_norm = train_cfg.get("max_grad_norm", 1.0)
     save_every = ckpt_cfg.get("save_every", 500)
     eval_every = ckpt_cfg.get("eval_every", 500)
-    output_dir = ckpt_cfg.get("output_dir", "checkpoints/")
     adapter_only = ckpt_cfg.get("save_adapter_only", True)
 
     # ---- Tracking ----------------------------------------------------------
-    best_val_loss = float("inf")
-    global_step = 0
+    global_step = resume_step
 
     # Initialize trackers
     if accelerator.is_main_process:
@@ -621,6 +803,7 @@ def main():
                 "gradient_accumulation_steps": grad_accum_steps,
                 "lora_r": cfg["lora"]["r"],
                 "noise_schedule": diff_cfg.get("noise_schedule", "log_linear"),
+                "resumed_from_step": resume_step,
             },
         )
 
@@ -634,16 +817,30 @@ def main():
     accelerator.print(f"  Mixed precision:      {mixed_precision}")
     accelerator.print(f"  Random truncation:    {use_random_truncation}")
     accelerator.print(f"  PAD loss weight:      {pad_loss_weight}")
+    accelerator.print(f"  Keep last checkpoints: {keep_last}")
+    if resume_step > 0:
+        accelerator.print(f"  Resuming from step:   {resume_step}")
     accelerator.print()
 
     model.train()
     t_start = time.time()
 
     for epoch in range(num_epochs):
+        # Skip completed epochs when resuming
+        if epoch < resume_epoch:
+            continue
+
         epoch_loss = 0.0
         epoch_steps = 0
 
         for batch_idx, batch in enumerate(train_loader):
+            # Skip batches already processed in resumed epoch
+            if epoch == resume_epoch and resume_step > 0:
+                batches_in_step = grad_accum_steps
+                completed_batches = (resume_step - (resume_epoch * steps_per_epoch)) * batches_in_step
+                if batch_idx < completed_batches:
+                    continue
+
             with accelerator.accumulate(model):
                 device = batch["prompt_ids"].device
 
@@ -723,9 +920,12 @@ def main():
                             f"  New best val loss: {best_val_loss:.4f} -- saving best adapter"
                         )
                         save_checkpoint(
-                            model, accelerator, output_dir,
-                            step=global_step, adapter_only=adapter_only,
-                            tag="best",
+                            model, optimizer, lr_scheduler,
+                            accelerator, output_dir,
+                            step=global_step, epoch=epoch,
+                            best_val_loss=best_val_loss,
+                            adapter_only=adapter_only,
+                            tag="best", keep_last=keep_last,
                         )
 
                     model.train()
@@ -733,8 +933,12 @@ def main():
                 # ---- Periodic checkpoint ---------------------------------------
                 if global_step % save_every == 0:
                     save_checkpoint(
-                        model, accelerator, output_dir,
-                        step=global_step, adapter_only=adapter_only,
+                        model, optimizer, lr_scheduler,
+                        accelerator, output_dir,
+                        step=global_step, epoch=epoch,
+                        best_val_loss=best_val_loss,
+                        adapter_only=adapter_only,
+                        keep_last=keep_last,
                     )
 
         # End-of-epoch logging
@@ -748,9 +952,12 @@ def main():
     accelerator.print("Training complete!")
     accelerator.print(f"  Best val loss: {best_val_loss:.4f}")
     save_checkpoint(
-        model, accelerator, output_dir,
-        step=global_step, adapter_only=adapter_only,
-        tag="final",
+        model, optimizer, lr_scheduler,
+        accelerator, output_dir,
+        step=global_step, epoch=num_epochs - 1,
+        best_val_loss=best_val_loss,
+        adapter_only=adapter_only,
+        tag="final", keep_last=keep_last,
     )
 
     # End tracking
