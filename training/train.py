@@ -1189,6 +1189,9 @@ def main():
 
                     model.train()
 
+                    # Free GPU memory after validation + potential checkpoint save
+                    torch.cuda.empty_cache()
+
                 # ---- Periodic checkpoint ---------------------------------------
                 if global_step % save_every == 0:
                     save_checkpoint(
@@ -1199,6 +1202,7 @@ def main():
                         adapter_only=adapter_only,
                         keep_last=keep_last,
                     )
+                    torch.cuda.empty_cache()
 
         # End-of-epoch logging
         avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
