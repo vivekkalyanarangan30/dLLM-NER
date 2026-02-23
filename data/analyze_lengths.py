@@ -256,7 +256,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     logger.info("Loading tokenizer: %s", args.tokenizer)
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
 
     logger.info("Loading dataset from: %s", args.data_dir)
     ds = load_from_disk(args.data_dir)
