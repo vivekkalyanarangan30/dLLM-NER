@@ -36,9 +36,9 @@ data:
 
 training:
   epochs: 5
-  batch_size_per_gpu: 2
+  batch_size_per_gpu: 1
   num_gpus: 1
-  gradient_accumulation_steps: 16  # effective batch = 2 * 1 * 16 = 32
+  gradient_accumulation_steps: 32  # effective batch = 1 * 1 * 32 = 32
   gradient_checkpointing: true
   learning_rate: 5.0e-5
   warmup_steps: 200

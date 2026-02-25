@@ -28,6 +28,7 @@ Google Colab with Drive::
 from __future__ import annotations
 
 import argparse
+import gc
 import glob
 import json
 import logging
@@ -1190,6 +1191,7 @@ def main():
                     model.train()
 
                     # Free GPU memory after validation + potential checkpoint save
+                    gc.collect()
                     torch.cuda.empty_cache()
 
                 # ---- Periodic checkpoint ---------------------------------------
@@ -1202,6 +1204,7 @@ def main():
                         adapter_only=adapter_only,
                         keep_last=keep_last,
                     )
+                    gc.collect()
                     torch.cuda.empty_cache()
 
         # End-of-epoch logging
